@@ -1,9 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.IO;
+using System.Linq;
 using Newtonsoft.Json;
+using LumenWorks.Framework.IO.Csv;
 using System.Text.RegularExpressions;
 
 namespace WeatherTag
@@ -11,374 +12,379 @@ namespace WeatherTag
     class Program
     {
         //**
+        //* Title:     Photo WeatherTag
         //* Author:    José Oliver-Didier
-        //* Created:   October 2018
-        //* Ref: https://github.com/josemoliver/WeatherTag
+        //* Purpose:   Tags images with weather data from a CSV history file using Exiftool.
+        //* History:
+        //*          - October  2018: Created initial version.
+        //*          - December 2024: Code cleanup, minor improvements.
+        //*          - December 2025: Updated, code cleanup, added HEIC and JPEG XL support.
+        //*
+        //* License:   MIT License
+        //* Ref:
+        //* https://github.com/josemoliver/WeatherTag
+        //* https://jmoliver.wordpress.com/2018/07/07/capturing-the-moment-and-the-ambient-weather-information-in-photos/
         //**
 
         static void Main(string[] args)
         {
+            // Parse command line parameters
+            // Get current directory as the working folder for images and CSV file
+            string activeFilePath = Directory.GetCurrentDirectory();
             
-            bool writeToFile                = false;                            //flag to perform write operation to save values to image metadata.
-            bool overwriteFile              = false;
-            string activeFilePath           = Directory.GetCurrentDirectory();  //current file directory.
-            List<WeatherReading> reading    = new List<WeatherReading>();       //weather reading values.
+            // Check if -write flag is present to enable writing weather data to files
+            bool writeToFile = args.Any(a => a.Equals("-write", StringComparison.OrdinalIgnoreCase));
+            
+            // Default time threshold for matching weather readings to photos (in minutes)
+            int thresholdMinutes = 30;
 
-
-            //Check for Exiftool - if not found display error message.
-            double exiftoolVersion = CheckExiftool();
-
-            if (exiftoolVersion!=0)
+            // Parse optional -threshold parameter to override default matching threshold
+            // Format: -threshold=N where N is the number of minutes
+            foreach (var arg in args)
             {
-                Console.WriteLine("Exiftool version " + exiftoolVersion);
+                if (arg.StartsWith("-threshold", StringComparison.OrdinalIgnoreCase))
+                {
+                    var parts = arg.Split('=');
+                    if (parts.Length == 2 && int.TryParse(parts[1], out int t))
+                    {
+                        thresholdMinutes = t;
+                    }
+                }
+            }
+
+            // Verify that exiftool.exe is available in the system PATH or current directory
+            // Exiftool is required for reading and writing EXIF metadata
+            double exiftoolVersion = CheckExiftool();
+            if (exiftoolVersion == 0)
+            {
+                Console.WriteLine("Exiftool not found! Photo WeatherTag needs exiftool in order to work properly.");
+                Environment.Exit(0);
             }
             else
             {
-                Console.WriteLine("Exiftool not found! WeatherTag needs exiftool in order to work properly.");
-                Environment.Exit(0);
+                Console.WriteLine("Exiftool version " + exiftoolVersion);
             }
 
-            //Fetch jpg and heic files in directory, if none found display error
-            string[] imageFiles = Directory.GetFiles(activeFilePath, "*.*").Where(file => file.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".heic", StringComparison.OrdinalIgnoreCase)).ToArray();
+            // Discover all supported image files in the current directory
+            // Supported formats: JPEG (.jpg, .jpeg), JPEG XL (.jxl), and HEIC (.heic)
+            string[] imageFiles = Directory.GetFiles(activeFilePath, "*.*")
+                .Where(file => file.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase)   //JPEG
+                            || file.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)   //JPEG
+                            || file.EndsWith(".jxl", StringComparison.OrdinalIgnoreCase)    //JPEG XL
+                            || file.EndsWith(".heic", StringComparison.OrdinalIgnoreCase))  //HEIC  
+                .ToArray();
 
-            if (imageFiles.Count()==0)
+            if (imageFiles.Length == 0)
             {
                 Console.WriteLine("No supported image files found.");
                 Environment.Exit(0);
             }
+
+            // Load weather history from CSV file
+            // Expected format: Date, Time, Temperature(°C), Humidity(%), Pressure(hPa)
+            // Examples of valid rows:
+            // 11/17/2025,4:44 AM,24.0 °C,88 %,"1,012.02 hPa"   -> With units
+            // 11/17/2025,4:44 AM,24.0,88,1012.02               -> Without units
+            // 11/17/2025,4:44 AM,24.0 °C,88,1012.02 hPa        -> Mixed (clean numeric values)
+            // 11-17-2025,04:44,24.0 °C,88 %,1012.02            -> Different date/time formats, date format (MM-DD-YYYY) and 24-hour time
+            // 11/17/2025,4:44 AM,24.0°C,88%,1012.02hPa         -> No spaces before units
             
-            string weatherHistoryFile = Directory.GetCurrentDirectory() + "\\weatherhistory.csv"; //Get weather history csv file
+            string weatherHistoryFile = Path.Combine(activeFilePath, "weatherhistory.csv");
+            List<WeatherReading> readings = ImportWeatherHistory(weatherHistoryFile);
 
-            
-            //Check for -write flag, if found then matched weather values will be writen back to the jpg file EXIF metadata.
-            for (int i=0; i<args.Count();i++)
+            // Initialize counters to track processing results for final summary
+            int matchedCount = 0;
+            int writtenCount = 0;
+            int noPhotoDateCount = 0;
+            int noReadingWithinThresholdCount = 0;
+
+            // Process each image file found in the directory
+            foreach (var file in imageFiles)
             {
-                if (args[i].ToString().ToLower().Trim()=="-write")
-                {
-                    writeToFile = true;
-                }
+                // Extract the CreateDate from the image's EXIF metadata
+                DateTime? photoDate = null;
+                try { photoDate = GetFileDate(file); }
+                catch { photoDate = null; }
 
-                if (args[i].ToString().ToLower().Trim() == "-overwrite")
-                {
-                    overwriteFile = true;
-                }
-            }
+                // Find the closest weather reading to the photo's timestamp
+                WeatherReading nearest = null;
+                double deltaMinutes = double.MaxValue;
 
-            if (writeToFile==false)
-            {
-                Console.WriteLine("No changes to file(s) will be performed - To write weather tags use -write flag");
-            }
-
-                        
-            //Load weather history file into stream
-            try
-            {
-                using (var reader = new StreamReader(weatherHistoryFile))
+                if (photoDate.HasValue)
                 {
-                    while (!reader.EndOfStream)
+                    // Linear search through all weather readings to find the nearest one
+                    // Calculate time difference in minutes for each reading
+                    foreach (var r in readings)
                     {
-                        var line = reader.ReadLine();
-
-                        var values = line.Split(',');
-
-                        Double ambientTemperature = 99999;
-                        Double humidity = 99999;
-                        Double pressure = 99999;
-
-                        DateTime dateWeatherReading = DateTime.Parse(values[0].ToString().Trim() + " " + values[1].ToString().Trim());
-
-
-                        //Load Ambient Temperature value, if invalid mark as invalid = 99999
-                        try
+                        var diff = Math.Abs((photoDate.Value - r.ReadingDate).TotalMinutes);
+                        if (diff < deltaMinutes)
                         {
-                            ambientTemperature = Double.Parse(RemoveNonNumeric(values[2].ToString().Trim()));
-
-                            //Check for valid Ambient Temperature Range in Celsius
-                            if ((ambientTemperature < -100) || (ambientTemperature > 150))
-                            {
-                                ambientTemperature = 99999;
-                            }
-
+                            deltaMinutes = diff;
+                            nearest = r;
                         }
-                        catch
-                        {
-                            ambientTemperature = 99999;
-                        }
-
-                        //Load Humidity value, if invalid mark as invalid = 99999
-                        try
-                        {
-                            humidity = Double.Parse(RemoveNonNumeric(values[3].ToString().Trim()));
-
-                            //Check for valid Humidity Range
-                            if ((humidity < 0) || (humidity > 100))
-                            {
-                                humidity = 99999;
-                            }
-
-                        }
-                        catch
-                        {
-                            humidity = 99999;
-                        }
-                        try
-                        {
-                            pressure = Double.Parse(RemoveNonNumeric(values[4].ToString().Trim()));
-
-                            //Check for valid Pressure Range
-                            if ((pressure < 800) || (pressure > 1100))
-                            {
-                                pressure = 99999;
-                            }
-                        }
-                        catch
-                        {
-                            pressure = 99999;
-                        }
-
-                        reading.Add(new WeatherReading(dateWeatherReading, ambientTemperature, humidity, pressure));
                     }
                 }
+
+                // Create result object with matched weather data and status
+                // Status can be: "Matched", "NoPhotoDate", or "NoReadingWithinThreshold"
+                var result = new
+                {
+                    File = file,
+                    PhotoDate = photoDate,
+                    ReadingDate = nearest?.ReadingDate,
+                    AmbientTemperature = nearest?.AmbientTemperature,
+                    Humidity = nearest?.Humidity,
+                    Pressure = nearest?.Pressure,
+                    Status = (nearest != null && deltaMinutes <= thresholdMinutes) ? "Matched" :
+                             (photoDate == null ? "NoPhotoDate" : "NoReadingWithinThreshold")
+                };
+
+                // Display the result for this image to console
+                Console.WriteLine($"{Path.GetFileName(file)} | {result.Status} | " +
+                    $"Temp={result.AmbientTemperature?.ToString() ?? "--"} °C, " +
+                    $"Hum={result.Humidity?.ToString() ?? "--"} %, " +
+                    $"Press={result.Pressure?.ToString() ?? "--"} hPa");
+
+                // Update status counters for summary report
+                if (result.Status == "Matched")
+                    matchedCount++;
+                else if (result.Status == "NoPhotoDate")
+                    noPhotoDateCount++;
+                else if (result.Status == "NoReadingWithinThreshold")
+                    noReadingWithinThresholdCount++;
+
+                // Write weather data to file if -write flag is set and a match was found
+                if (writeToFile && nearest != null && deltaMinutes <= thresholdMinutes)
+                {
+                    WriteFileInfo(file, nearest);
+                    writtenCount++;
+                }
             }
-            catch (Exception e)
+
+            // Display comprehensive summary of all operations performed
+            // Shows statistics for: total files, matches, errors, and files written
+            Console.WriteLine("\n" + new string('=', 60));
+            Console.WriteLine("SUMMARY");
+            Console.WriteLine(new string('=', 60));
+            Console.WriteLine($"Total images processed: {imageFiles.Length}");
+            Console.WriteLine($"Weather readings loaded: {readings.Count}");
+            Console.WriteLine($"Matched (within {thresholdMinutes} min threshold): {matchedCount}");
+            Console.WriteLine($"No photo date found: {noPhotoDateCount}");
+            Console.WriteLine($"No reading within threshold: {noReadingWithinThresholdCount}");
+            if (writeToFile)
             {
-                Console.WriteLine(weatherHistoryFile + " not found or unable to open.");
-                Console.WriteLine(e.ToString());
+                Console.WriteLine($"Files written with weather data: {writtenCount}");
+            }
+            else
+            {
+                Console.WriteLine("\nNote: Running in preview mode. Use -write to save weather data to files.");
+            }
+            Console.WriteLine(new string('=', 60));
+        }
+
+        /// <summary>
+        /// Imports weather history from a CSV file
+        /// Expected format: Date, Time, Temperature, Humidity, Pressure
+        /// Automatically detects and skips header rows
+        /// </summary>
+        static List<WeatherReading> ImportWeatherHistory(string csvPath)
+        {
+            var readings = new List<WeatherReading>();
+
+            // Verify CSV file exists before attempting to read
+            if (!File.Exists(csvPath))
+            {
+                Console.WriteLine($"{csvPath} not found.");
                 Environment.Exit(0);
             }
 
-
-            //For each image file in the folder, add the closest reading from the weather history file.
-            for (int q = 0; q < imageFiles.Count(); q++)
+            using (var csv = new CsvReader(new StreamReader(csvPath), hasHeaders: false))
             {
+                bool isFirstRow = true;
 
-                DateTime photoDate;
-                bool noPhotoDate = false;
-
-                //Get the image's Created Time, if not found or an error occurs set to error value of 1/1/2050 12:00 AM
-                try
+                while (csv.ReadNextRecord())
                 {
-                    photoDate = GetFileDate(imageFiles[q]);
-                }
-                catch
-                {
-                    photoDate = DateTime.Parse("1/1/2050 12:00 AM");
-                    noPhotoDate = true;
-                }
+                    // Ensure row has at least 5 columns (Date, Time, Temp, Humidity, Pressure)
+                    if (csv.FieldCount < 5)
+                        continue;
 
-                Double minDiffTime = 30;
-                WeatherReading closestReading = new WeatherReading(DateTime.Parse("1/1/1900 12:00 AM"), 0, 0, 0);
+                    string dateField = csv[0]?.Trim();
+                    string timeField = csv[1]?.Trim();
 
-                if (noPhotoDate == false)
-                {
-                    for (int i = 0; i < reading.Count; i++)
+                    // Auto-detect and skip header row on first iteration
+                    // If the first row's date/time fields cannot be parsed, assume it's a header
+                    if (isFirstRow)
                     {
-                        TimeSpan diffTime = photoDate - reading[i].ReadingDate;
-                        if (Math.Abs(diffTime.TotalMinutes) < minDiffTime)
+                        isFirstRow = false;
+                        if (!DateTime.TryParse(dateField + " " + timeField, out DateTime _))
                         {
-                            closestReading = reading[i];
-                            minDiffTime = Math.Abs(diffTime.TotalMinutes);
+                            Console.WriteLine("Header row detected and skipped.");
+                            continue;
                         }
                     }
-                }
 
+                    // Parse date and time into a DateTime object
+                    if (!DateTime.TryParse(dateField + " " + timeField, out DateTime dt))
+                        continue;
 
-                Console.WriteLine("------ File " + (q+1).ToString()+ " of " + imageFiles.Count() + " ------");
-                Console.WriteLine(minDiffTime.ToString());
+                    // Parse weather values with validation ranges
+                    // Temperature: -100°C to 150°C, Humidity: 0% to 100%, Pressure: 800 to 1100 hPa
+                    double? temp = TryParseDouble(csv[2], -100, 150);
+                    double? hum = TryParseDouble(csv[3], 0, 100);
+                    double? press = TryParseDouble(csv[4], 800, 1100);
 
-                if (minDiffTime < 30)
-                {
-
-                    string consoleOutput = "";
-
-                    if (closestReading.AmbientTemperature != 99999)
-                    {
-                        consoleOutput = consoleOutput + " " + closestReading.AmbientTemperature.ToString() + " °C ";
-                    }
-                    else
-                    {
-                        consoleOutput = consoleOutput + " -- °C ";
-                    }
-
-                    if (closestReading.Humidity != 99999)
-                    {
-                        consoleOutput = consoleOutput + " " + closestReading.Humidity.ToString() + " %";
-                    }
-                    else
-                    {
-                        consoleOutput = consoleOutput + " -- % ";
-                    }
-
-                    if (closestReading.Pressure != 99999)
-                    {
-                        consoleOutput = consoleOutput + " " + closestReading.Pressure.ToString() + " hPa";
-                    }
-                    else
-                    {
-                        consoleOutput = consoleOutput + " -- hPa ";
-                    }
-
-                    Console.WriteLine(imageFiles[q].ToString().Replace(Directory.GetCurrentDirectory(),"").Trim()+" - "+ consoleOutput);
-                    if (writeToFile == true)
-                    {
-                        string WriteStatus = WriteFileInfo(imageFiles[q], closestReading, overwriteFile);
-                        Console.WriteLine(WriteStatus);
-                    }
-                   
-                }
-                else
-                {
-                    if (noPhotoDate == true)
-                    {
-                        Console.WriteLine(imageFiles[q].ToString().Replace(Directory.GetCurrentDirectory(), "").Trim() + " - Photo file has no date and time.");
-                    }
-                    else
-                    {
-                        Console.WriteLine(imageFiles[q].ToString().Replace(Directory.GetCurrentDirectory(), "").Trim() + " - No reading found.");
-                    }
+                    readings.Add(new WeatherReading(dt, temp, hum, press));
                 }
             }
 
-            Console.WriteLine();
-
+            // Sort readings chronologically for efficient searching
+            return readings.OrderBy(r => r.ReadingDate).ToList();
         }
 
-        static string RemoveNonNumeric(string input) { return Regex.Replace(input, @"[^0-9\.\-]", ""); }
-
-        public static DateTime GetFileDate(string file)
+        /// <summary>
+        /// Safely parses a string to a double with range validation
+        /// Returns null if parsing fails or value is out of range
+        /// Removes non-numeric characters (except digits, decimal point, and minus sign)
+        /// </summary>
+        static double? TryParseDouble(string input, double min, double max)
         {
-            //Retrieve Image Date
-            List<ExifToolJSON> ExifToolResponse;
-            string createDateTime = "";
-            string createDate = "";
-            string createTime = "";
-
-            // Start Process
-            Process p = new Process();
-
-            // Redirect the output stream of the child process.
-            p.StartInfo.UseShellExecute = false;
-            p.StartInfo.RedirectStandardOutput = true;
-            p.StartInfo.CreateNoWindow = true;
-            p.StartInfo.Arguments = "\"" + file + "\" -CreateDate -mwg -json";
-            p.StartInfo.FileName = "exiftool.exe";
-            p.Start();
-
-
-            // Read the output stream 
-            string json = p.StandardOutput.ReadToEnd();
-            p.WaitForExit();
-            
-            if (json != "")
-            {
-                ExifToolResponse = JsonConvert.DeserializeObject<List<ExifToolJSON>>(json);
-                createDateTime = ExifToolResponse[0].CreateDate.ToString().Trim();
-                string[] words = createDateTime.Split(' ');
-                createDate = words[0].ToString().Replace(":","/");
-                createTime = words[1].ToString();
-                createDateTime = createDate + " " + createTime;
-            }
-            
-            return DateTime.Parse(createDateTime);
-        }
-
-        public static double CheckExiftool()
-        {
-
-            double exiftoolreturn = 0;
+            if (string.IsNullOrWhiteSpace(input))
+                return null;
 
             try
-            { 
-
-            // Start Process
-                Process p = new Process();
-
-            // Redirect the output stream of the child process.
-            p.StartInfo.UseShellExecute = false;
-            p.StartInfo.RedirectStandardOutput = true;
-            p.StartInfo.CreateNoWindow = true;
-            p.StartInfo.Arguments = "-ver";
-            p.StartInfo.FileName = "exiftool.exe";
-            p.Start();
-
-            
-            // Read the output stream
-           
-                string exiftooloutput = p.StandardOutput.ReadToEnd().Trim();
-                exiftoolreturn = double.Parse(exiftooloutput);
-                p.WaitForExit(8000);
-           }
-           catch
             {
-               exiftoolreturn = 0;
-            }
+                // Remove any non-numeric characters (e.g., units like °C, %, hPa)
+                var cleaned = RemoveNonNumeric(input);
+                if (string.IsNullOrWhiteSpace(cleaned))
+                    return null;
 
-            return exiftoolreturn;
+                // Parse using invariant culture to handle decimal separators consistently
+                double val = double.Parse(cleaned, System.Globalization.CultureInfo.InvariantCulture);
+                
+                // Validate that the value is within the expected range
+                if (val < min || val > max) return null;
+                return val;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
-        public static string WriteFileInfo(string File, WeatherReading reading, bool overwriteFile)
+        /// <summary>
+        /// Removes all non-numeric characters except digits, decimal point, and minus sign
+        /// Used to clean weather data that may contain unit symbols
+        /// </summary>
+        static string RemoveNonNumeric(string input) => Regex.Replace(input, @"[^0-9\.\-]", "");
+
+        /// <summary>
+        /// Extracts the CreateDate from an image file's EXIF metadata using exiftool
+        /// Returns the date/time when the photo was taken
+        /// </summary>
+        public static DateTime GetFileDate(string file)
         {
-            //Write Weather Values back to file
-
-            string output = "";
-            // Start the child process.
+            // Execute exiftool to extract CreateDate field from image EXIF data
+            // Uses -mwg option for Metadata Working Group compatibility
+            // Returns JSON format for easy parsing
             Process p = new Process();
-
-            string Arguments = "";
-
-            if (reading.AmbientTemperature != 99999)
-            {
-                Arguments = Arguments + " -\"AmbientTemperature=" + reading.AmbientTemperature + "\"";
-            }
-            if (reading.Humidity != 99999)
-            {
-                Arguments = Arguments + " -\"Humidity=" + reading.Humidity + "\"";
-            }
-            if (reading.Pressure != 99999)
-            {
-                Arguments = Arguments + " -\"Pressure=" + reading.Pressure + "\"";
-            }
-            if (overwriteFile==true)
-            {
-                Arguments = Arguments + " -overwrite_original";
-            }
-
-
-            // Redirect the output stream of the child process.
             p.StartInfo.UseShellExecute = false;
             p.StartInfo.RedirectStandardOutput = true;
             p.StartInfo.CreateNoWindow = true;
-            p.StartInfo.Arguments = "\""+File+"\"" + Arguments;
+            p.StartInfo.Arguments = $"\"{file}\" -CreateDate -mwg -json";
             p.StartInfo.FileName = "exiftool.exe";
             p.Start();
-            output = File + Arguments+" --- " + p.StandardOutput.ReadToEnd();
-            p.WaitForExit(10000);
 
-            return output;
+            string json = p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+
+            // Parse JSON response and extract CreateDate field
+            var exifResponse = JsonConvert.DeserializeObject<List<ExifToolJSON>>(json);
+            string raw = exifResponse[0].CreateDate.Trim();
+            
+            // Parse EXIF date format (yyyy:MM:dd HH:mm:ss) into DateTime object
+            return DateTime.ParseExact(raw, "yyyy:MM:dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
         }
 
+        /// <summary>
+        /// Checks if exiftool is available and returns its version number
+        /// Returns 0 if exiftool is not found or cannot be executed
+        /// </summary>
+        public static double CheckExiftool()
+        {
+            try
+            {
+                // Execute exiftool with -ver flag to get version number
+                Process p = new Process();
+                p.StartInfo.UseShellExecute = false;
+                p.StartInfo.RedirectStandardOutput = true;
+                p.StartInfo.CreateNoWindow = true;
+                p.StartInfo.Arguments = "-ver";
+                p.StartInfo.FileName = "exiftool.exe";
+                p.Start();
+
+                string output = p.StandardOutput.ReadToEnd().Trim();
+                p.WaitForExit();
+                return double.Parse(output);
+            }
+            catch { return 0; }  // Return 0 if exiftool is not found
+        }
+
+        /// <summary>
+        /// Writes weather data to an image file's EXIF metadata using exiftool
+        /// Only writes fields that have values (temperature, humidity, pressure)
+        /// Overwrites the original file without creating a backup
+        /// </summary>
+        public static void WriteFileInfo(string file, WeatherReading reading)
+        {
+            // Build exiftool arguments for available weather data fields
+            var args = new List<string>();
+            if (reading.AmbientTemperature.HasValue) args.Add($"-AmbientTemperature={reading.AmbientTemperature}");
+            if (reading.Humidity.HasValue) args.Add($"-Humidity={reading.Humidity}");
+            if (reading.Pressure.HasValue) args.Add($"-Pressure={reading.Pressure}");
+            
+            // Use -overwrite_original to modify file in place without backup
+            args.Add("-overwrite_original");
+
+            // Execute exiftool to write weather data to EXIF metadata
+            Process p = new Process();
+            p.StartInfo.UseShellExecute = false;
+            p.StartInfo.RedirectStandardOutput = true;
+            p.StartInfo.CreateNoWindow = true;
+            p.StartInfo.Arguments = $"\"{file}\" {string.Join(" ", args)}";
+            p.StartInfo.FileName = "exiftool.exe";
+            p.Start();
+            p.WaitForExit();
+        }
+
+        /// <summary>
+        /// Data structure for deserializing exiftool JSON output
+        /// Matches the JSON format returned by exiftool -json command
+        /// </summary>
         public class ExifToolJSON
         {
             public string SourceFile { get; set; }
             public string CreateDate { get; set; }
         }
 
-        
+        /// <summary>
+        /// Represents a single weather reading with timestamp and measurements
+        /// Temperature in Celsius, Humidity in percentage, Pressure in hectopascals (hPa)
+        /// All weather values are nullable to handle missing or invalid data
+        /// </summary>
         public class WeatherReading
         {
-            public WeatherReading(DateTime readingDate, double ambientTemperature, double humidity, double pressure)
+            public WeatherReading(DateTime readingDate, double? ambientTemperature, double? humidity, double? pressure)
             {
-                this.ReadingDate = readingDate;
-                this.AmbientTemperature = ambientTemperature;
-                this.Humidity = humidity;
-                this.Pressure = pressure;
+                ReadingDate = readingDate;
+                AmbientTemperature = ambientTemperature;
+                Humidity = humidity;
+                Pressure = pressure;
             }
 
             public DateTime ReadingDate { get; set; }
-            public double AmbientTemperature { get; set; }
-            public double Humidity { get; set; }
-            public double Pressure { get; set; }
+            public double? AmbientTemperature { get; set; }  // Temperature in °C
+            public double? Humidity { get; set; }             // Relative humidity in %
+            public double? Pressure { get; set; }             // Atmospheric pressure in hPa
         }
     }
 }
-
