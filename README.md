@@ -1,7 +1,7 @@
 # Photo Weather Tag
 Capturing the moment and the weather in images.
 
-![Photo WeatherTag](https://github.com/josemoliver/PhotoWeatherTag/raw/main/blob/PhotoWeatherTag.png "Photo Weather Tag")
+![Photo WeatherTag](https://github.com/josemoliver/PhotoWeatherTag/blob/master/blob/PhotoWeatherTag.png "Photo Weather Tag")
 
 ## Introduction
 
@@ -107,4 +107,4 @@ Exiftool can read these values using the appropriate command line tags. For exam
 ### Geosetter
 Geosetter (https://www.geosetter.de/en/main-en/) is a Windows freeware application which can read the EXIF 2.31 file metadata.
 
-![Screenshot from Geosetter displaying the weather related EXIF tags for a photo in its Image Info panel.](https://github.com/josemoliver/PhotoWeatherTag/raw/main/blob/geosetter_exif_weather_tags.png "Screenshot from Geosetter displaying the weather related EXIF tags for a photo in its Image Info panel.")
+![Screenshot from Geosetter displaying the weather related EXIF tags for a photo in its Image Info panel.](https://github.com/josemoliver/PhotoWeatherTag/raw/master/blob/geosetter_exif_weather_tags.png "Screenshot from Geosetter displaying the weather related EXIF tags for a photo in its Image Info panel.")
